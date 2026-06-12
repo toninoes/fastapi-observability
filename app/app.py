@@ -20,11 +20,13 @@ from opentelemetry.metrics import set_meter_provider
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+from opentelemetry.propagate import inject
 
 import uuid
 import os
 import structlog
 import logging
+import httpx
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -206,6 +208,34 @@ def create_payment(payment: PaymentRequest):
     with tracer.start_as_current_span("payment.process") as span:
         span.set_attribute("payment.amount", payment.amount)
         span.set_attribute("payment.currency", payment.currency)
+
+        # Llama al fraud-service propagando el contexto de traza
+        headers = {}
+        inject(headers)
+        fraud_url = os.getenv("FRAUD_SERVICE_URL", "http://fraud-service:8001")
+        fraud_resp = httpx.post(
+            f"{fraud_url}/check",
+            json={
+                "amount": payment.amount,
+                "currency": payment.currency,
+                "payment_id": "",
+            },
+            headers=headers,
+            timeout=5.0,
+        )
+        fraud_result = fraud_resp.json()
+
+        if fraud_result.get("status") == "rejected":
+            span.set_attribute("fraud.result", "rejected")
+            span.set_attribute("fraud.reason", fraud_result.get("reason", ""))
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=422,
+                detail=f"Pago rechazado: {fraud_result.get('reason', 'fraude detectado')}",
+            )
+
+        span.set_attribute("fraud.result", "approved")
+
         with Session(engine) as session:
             new_payment = Payment(
                 amount=payment.amount,

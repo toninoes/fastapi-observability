@@ -9,3 +9,4 @@ opentelemetry-sdk==1.42.1
 opentelemetry-instrumentation-fastapi==0.63b1
 opentelemetry-instrumentation-sqlalchemy==0.63b1
 opentelemetry-exporter-otlp-proto-grpc==1.42.1
+httpx==0.28.1

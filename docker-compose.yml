@@ -306,6 +306,20 @@ services:
     restart: unless-stopped
     mem_limit: 128m
 
+  fraud-service:
+    build:
+      context: ./fraud-service
+      dockerfile: Dockerfile
+    container_name: fraud-service
+    ports:
+      - "8001:8001"
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+    mem_limit: 32m
+
 volumes:
   postgres_data:
   prometheus_data:
