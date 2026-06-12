@@ -1615,33 +1615,117 @@ YouTube:
 ### 🔵 Fase 9: Segunda instancia de Prometheus y deduplicación real con Thanos
 
 **Concepto:** en la Fase 6 configuramos la deduplicación de Thanos con
-`replica="prometheus-1"` pero nunca la hemos probado de verdad porque solo
-hay una instancia de Prometheus. En esta fase levantamos una segunda instancia
-(`replica="prometheus-2"`) scrapeando los mismos targets y verificamos que
-Thanos Query deduplica correctamente.
+`replica="prometheus-1"` pero nunca la probamos de verdad porque solo había
+una instancia de Prometheus. En esta fase levantamos una segunda instancia
+(`replica="prometheus-2"`) scrapeando los mismos targets, configuramos el
+Collector para enviar métricas a ambas instancias, y verificamos que Thanos
+Query deduplica correctamente y que el stack sobrevive la caída de una instancia.
 
 **¿Por qué dos instancias de Prometheus?**
 
 En producción se usan dos instancias idénticas scrapeando los mismos targets
 para garantizar alta disponibilidad. Si una cae, la otra sigue recogiendo
-métricas. El problema es que Grafana vería las series duplicadas. Thanos Query
-resuelve esto: detecta que ambas instancias tienen el mismo `cluster` pero
-distinto `replica` y fusiona las series, devolviendo una sola.
+métricas. Sin Thanos, Grafana vería series duplicadas. Con Thanos Query y
+`--query.replica-label=replica`, las series con el mismo `cluster` pero
+distinto `replica` se fusionan en una sola.
 
-**Flujo con deduplicación:**
+**Flujo completo con HA:**
 ```
-Prometheus-1 {cluster="local", replica="prometheus-1"} ---> Thanos Sidecar-1 ---> MinIO
-Prometheus-2 {cluster="local", replica="prometheus-2"} ---> Thanos Sidecar-2 ---> MinIO
+OTEL Collector --remote write--> prometheus:9090   (replica=prometheus-1)
+               --remote write--> prometheus-2:9090 (replica=prometheus-2)
+
+prometheus   ---> thanos-sidecar   ---> MinIO
+prometheus-2 ---> thanos-sidecar-2 ---> MinIO
 
 Grafana --> Thanos Query --> deduplica por replica --> 1 serie limpia
+                        --> Thanos Store (histórico)
+```
+
+**Si cae `prometheus-1`:**
+```
+OTEL Collector --remote write falla--> prometheus:9090   (DOWN)
+               --remote write OK  --> prometheus-2:9090 (UP)
+
+Grafana --> Thanos Query --> thanos-sidecar (DOWN, ignorado)
+                        --> thanos-sidecar-2 (UP, sirve datos)
+                        --> Thanos Store (histórico)
+                        --> datos disponibles sin interrupción
+```
+
+**Remote write dual en el OTEL Collector:**
+
+Para que las métricas OTel sobrevivan la caída de una instancia, el Collector
+debe enviar a ambas. Se usan dos exporters con nombre compuesto:
+
+```yaml
+exporters:
+  prometheusremotewrite/p1:
+    endpoint: http://prometheus:9090/api/v1/write
+  prometheusremotewrite/p2:
+    endpoint: http://prometheus-2:9090/api/v1/write
+
+service:
+  pipelines:
+    metrics:
+      exporters: [prometheusremotewrite/p1, prometheusremotewrite/p2]
 ```
 
 **Qué se hace:**
-- Añadir `prometheus-2` con `replica: prometheus-2` en `external_labels`
-- Añadir `thanos-sidecar-2` para la segunda instancia
-- Actualizar Thanos Query con el nuevo endpoint `--endpoint=thanos-sidecar-2:10901`
-- Verificar en Grafana que no hay series duplicadas
-- Simular caída de `prometheus-1` y verificar que los dashboards siguen funcionando
+- Crear `prometheus/prometheus2.yml` con `replica: prometheus-2`
+- Añadir `prometheus-2` con volumen propio `prometheus2_data`
+- Añadir `thanos-sidecar-2` apuntando a `prometheus-2`
+- Actualizar `thanos-query` con el nuevo endpoint `--endpoint=thanos-sidecar-2:10901`
+- Actualizar `otel-collector-config.yml` con remote write dual
+- Verificar deduplicación: `Result series: 1` sin label `replica` en Grafana
+- Verificar HA: parar `prometheus-1` y confirmar que los datos siguen disponibles
+
+**Ficheros nuevos/modificados:**
+```
+prometheus/
+└── prometheus2.yml             # config segunda instancia
+docker-compose.yml              # prometheus-2, thanos-sidecar-2, volumen prometheus2_data
+                                # thanos-query con --endpoint=thanos-sidecar-2:10901
+otel-collector/
+└── otel-collector-config.yml   # prometheusremotewrite/p1 y /p2
+```
+
+**Verificación de deduplicación en Grafana:**
+
+Con ambas instancias activas, `payments_created_total` devuelve:
+- `Result series: 1` — una sola serie ✅
+- Labels: `cluster="local"` sin `replica` ✅
+- Thanos Query eliminó el label `replica` al deduplicar
+
+Sin deduplicación aparecerían dos series:
+```
+payments_created_total{cluster="local", replica="prometheus-1"} 26
+payments_created_total{cluster="local", replica="prometheus-2"} 26
+```
+
+**Verificación de HA:**
+
+```bash
+# Para prometheus-1 y su sidecar
+docker compose stop prometheus thanos-sidecar
+
+# Las métricas scrapeadas (infraestructura) siguen disponibles via prometheus-2
+curl -s "http://localhost:10902/api/v1/query?query=node_cpu_seconds_total" | \
+  python3 -m json.tool | grep value | head -2
+
+# Las métricas OTel también (gracias al remote write dual)
+curl -s "http://localhost:10902/api/v1/query?query=payments_created_total" | \
+  python3 -m json.tool | grep value
+
+# Levanta de nuevo
+docker compose start prometheus thanos-sidecar
+```
+
+**URLs añadidas:**
+
+| Servicio | URL |
+|---|---|
+| Prometheus-2 UI | http://localhost:9091 |
+| Thanos Stores | http://localhost:10902/stores (muestra 2 sidecars) |
 
 **Para profundizar:**
 
@@ -1649,6 +1733,7 @@ Grafana --> Thanos Query --> deduplica por replica --> 1 serie limpia
 |---|---|
 | Thanos HA setup | https://thanos.io/tip/thanos/quick-tutorial.md/#ha-prometheus-with-thanos |
 | Thanos deduplication | https://thanos.io/tip/thanos/query.md/#deduplication |
+| Prometheus HA | https://prometheus.io/docs/introduction/faq/#can-prometheus-be-made-highly-available |
 
 ---
 
