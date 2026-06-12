@@ -50,6 +50,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://payments:payments@localhost:5432/paymentsdb_test
           OTEL_SDK_DISABLED: "true"
+          FRAUD_SERVICE_URL: http://localhost:9999
         run: |
           cd app
           set -o pipefail

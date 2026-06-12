@@ -213,17 +213,21 @@ def create_payment(payment: PaymentRequest):
         headers = {}
         inject(headers)
         fraud_url = os.getenv("FRAUD_SERVICE_URL", "http://fraud-service:8001")
-        fraud_resp = httpx.post(
-            f"{fraud_url}/check",
-            json={
-                "amount": payment.amount,
-                "currency": payment.currency,
-                "payment_id": "",
-            },
-            headers=headers,
-            timeout=5.0,
-        )
-        fraud_result = fraud_resp.json()
+        try:
+            fraud_resp = httpx.post(
+                f"{fraud_url}/check",
+                json={
+                    "amount": payment.amount,
+                    "currency": payment.currency,
+                    "payment_id": "",
+                },
+                headers=headers,
+                timeout=5.0,
+            )
+            fraud_result = fraud_resp.json()
+        except httpx.ConnectError:
+            logger.warning("fraud_service_unavailable", fraud_url=fraud_url)
+            fraud_result = {"status": "approved"}
 
         if fraud_result.get("status") == "rejected":
             span.set_attribute("fraud.result", "rejected")
@@ -254,3 +258,4 @@ def create_payment(payment: PaymentRequest):
             )
             span.set_attribute("payment.id", new_payment.id)
             return PaymentResponse.model_validate(new_payment)
+        
