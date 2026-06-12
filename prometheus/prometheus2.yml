@@ -3,7 +3,7 @@ global:
   evaluation_interval: 15s
   external_labels:
     cluster: local
-    replica: prometheus-1
+    replica: prometheus-2
 
 alerting:
   alertmanagers:
@@ -47,3 +47,4 @@ scrape_configs:
         target_label: instance
       - target_label: __address__
         replacement: blackbox-exporter:9115
+
