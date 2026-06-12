@@ -1,0 +1,48 @@
+groups:
+  - name: payment-api
+    interval: 15s
+    rules:
+      - alert: PaymentApiDown
+        expr: probe_success{job="payment-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Payment API caída"
+          description: "El servicio payment-api lleva más de 1 minuto sin responder."
+
+      - alert: OtelCollectorDown
+        expr: up{job="otel-collector"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OTEL Collector caído"
+          description: "El OTEL Collector lleva más de 1 minuto sin responder."
+
+      - alert: PrometheusTargetDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Target de Prometheus caído"
+          description: "El target {{ $labels.job }} ({{ $labels.instance }}) lleva más de 2 minutos caído."
+
+      - alert: HighPaymentLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (
+              rate(http_server_request_duration_seconds_bucket{
+                http_route="/payments",
+                http_request_method="POST"
+              }[5m])
+            )
+          ) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Latencia alta en pagos"
+          description: "El p99 de latencia en POST /payments lleva más de 2 minutos por encima de 500ms."
+

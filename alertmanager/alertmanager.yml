@@ -1,0 +1,16 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: [alertname, job]
+  group_wait: 30s
+  group_interval: 1m
+  repeat_interval: 1m
+  receiver: webhook
+
+receivers:
+  - name: webhook
+    webhook_configs:
+      - url: https://webhook.site/86371dd2-8b0d-4557-8345-20b6af5be903
+        send_resolved: true
+

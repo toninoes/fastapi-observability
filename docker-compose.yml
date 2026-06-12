@@ -40,6 +40,7 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus/rules:/etc/prometheus/rules
       - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -48,6 +49,7 @@ services:
       - "--storage.tsdb.min-block-duration=2h"
       - "--storage.tsdb.max-block-duration=2h"
       - "--web.enable-remote-write-receiver"
+      - "--web.enable-lifecycle"
     restart: unless-stopped
     mem_limit: 512m
 
@@ -239,6 +241,28 @@ services:
       exit 0;
       "
     restart: on-failure
+
+  alertmanager:
+    image: prom/alertmanager:v0.32.2
+    container_name: alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      - "--log.level=debug"
+    restart: unless-stopped
+    mem_limit: 64m
+
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.28.0
+    container_name: blackbox-exporter
+    ports:
+      - "9115:9115"
+    restart: unless-stopped
+    mem_limit: 32m
 
 volumes:
   postgres_data:
