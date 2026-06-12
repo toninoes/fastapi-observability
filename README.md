@@ -1419,31 +1419,182 @@ en MinIO y sobreviven reinicios del stack completo.
 **Concepto:** tener métricas sin alertas es solo la mitad del trabajo. En
 producción necesitas saber cuándo algo va mal sin estar mirando dashboards
 constantemente. Alertmanager recibe las alertas que dispara Prometheus y
-las enruta a los canales de notificación configurados (email, Slack, PagerDuty).
-
-**Arquitectura:**
-```
-Prometheus --evalúa reglas--> dispara alerta --> Alertmanager --> Slack/Email
-                                                              --> PagerDuty
-                                                              --> silencio/agrupación
-```
+las enruta a los canales de notificación configurados.
 
 **¿Qué es Alertmanager?**
 
-Alertmanager recibe alertas de Prometheus y aplica lógica de enrutamiento:
-agrupa alertas relacionadas para evitar spam, silencia alertas durante
-mantenimientos, inhibe alertas secundarias cuando hay un problema mayor,
-y enruta al canal correcto según labels (equipo, severidad, entorno).
+Alertmanager recibe alertas de Prometheus y aplica lógica de enrutamiento.
+El flujo es:
+
+```
+Prometheus --evalúa reglas cada 15s--> condición cumplida durante "for"
+           --> alerta FIRING --> Alertmanager
+                                      |
+                         +------------+------------+
+                         |                         |
+                      agrupa                    silencia
+                      inhibe                    enruta
+                         |
+                    Webhook/Slack/Email/PagerDuty
+```
+
+La separación entre Prometheus y Alertmanager es intencional. Prometheus
+decide cuándo una alerta existe. Alertmanager decide a quién se le notifica,
+cómo se agrupa y cuándo se repite. Esta separación permite gestionar la
+"alerta fatiga" sin tocar las reglas de detección.
+
+**Conceptos clave de Alertmanager:**
+
+`group_by`: agrupa alertas relacionadas en una sola notificación. Si caen
+5 instancias a la vez, recibes 1 notificación, no 5.
+
+`group_wait`: tiempo que espera antes de enviar la primera notificación del
+grupo. Da margen para que lleguen alertas relacionadas y agruparlas.
+
+`repeat_interval`: cada cuánto se reenvía la notificación si la alerta sigue
+activa. Evita spam pero garantiza que no se olvide un incidente.
+
+`inhibit_rules`: suprime alertas secundarias cuando hay una primaria activa.
+Si el servidor está caído (`critical`), no tiene sentido recibir también las
+alertas de latencia alta (`warning`) del mismo servidor.
+
+**¿Qué es el blackbox_exporter?**
+
+Es un exporter de Prometheus para probar endpoints externos via HTTP, TCP,
+ICMP o DNS. No scraping métricas de la app: comprueba si el endpoint responde.
+La métrica clave es `probe_success=1` (OK) o `probe_success=0` (KO).
+
+Sin blackbox_exporter, `up{job="payment-api"}` no existe porque la app usa
+OTLP (push) en vez de scraping. El blackbox_exporter convierte un endpoint
+HTTP en un target de Prometheus.
 
 **Qué se hace:**
-- Levantar Alertmanager con config de enrutamiento
-- Definir reglas de alerta en Prometheus para la API de pagos:
-  - `PaymentApiDown`: la API no responde
-  - `HighPaymentErrorRate`: tasa de errores > umbral
-  - `SlowPaymentLatency`: p99 latencia > 500ms
-  - `OtelCollectorDown`: el Collector no exporta
-- Configurar notificaciones a un webhook de prueba (webhook.site o similar)
-- Verifica la alerta en Grafana -> Alerting
+- Levantar Alertmanager con config de enrutamiento a webhook
+- Levantar blackbox_exporter para probar el endpoint `/health` de la API
+- Añadir scrape job para el blackbox_exporter en Prometheus con relabeling
+- Habilitar `--web.enable-lifecycle` en Prometheus para reloads sin restart
+- Definir reglas de alerta en `prometheus/rules/payment-api.yml`
+- Verificar el flujo completo parando la API
+
+**Ficheros nuevos/modificados:**
+```
+alertmanager/
+└── alertmanager.yml            # config de enrutamiento y receivers
+prometheus/rules/
+└── payment-api.yml             # reglas de alerta
+prometheus/prometheus.yml       # añade alerting, rule_files y blackbox scrape
+docker-compose.yml              # añade alertmanager y blackbox-exporter
+```
+
+**Reglas de alerta implementadas:**
+
+```yaml
+- alert: PaymentApiDown
+  expr: probe_success{job="payment-api"} == 0
+  for: 1m
+  labels:
+    severity: critical
+
+- alert: OtelCollectorDown
+  expr: up{job="otel-collector"} == 0
+  for: 1m
+  labels:
+    severity: critical
+
+- alert: PrometheusTargetDown
+  expr: up == 0
+  for: 2m
+  labels:
+    severity: warning
+
+- alert: HighPaymentLatency
+  expr: |
+    histogram_quantile(0.99,
+      sum by (le) (
+        rate(http_server_request_duration_seconds_bucket{
+          http_route="/payments",
+          http_request_method="POST"
+        }[5m])
+      )
+    ) > 0.5
+  for: 2m
+  labels:
+    severity: warning
+```
+
+**Scrape job para el blackbox_exporter:**
+
+El relabeling convierte la dirección del target en el parámetro `target`
+del probe, y apunta el scrape al blackbox_exporter:
+
+```yaml
+- job_name: payment-api
+  metrics_path: /probe
+  params:
+    module: [http_2xx]
+  static_configs:
+    - targets: [http://payment-api:8000/health]
+  relabel_configs:
+    - source_labels: [__address__]
+      target_label: __param_target
+    - source_labels: [__param_target]
+      target_label: instance
+    - target_label: __address__
+      replacement: blackbox-exporter:9115
+```
+
+**Payload de notificación recibido (ejemplo real):**
+
+```json
+{
+  "receiver": "webhook",
+  "status": "resolved",
+  "alerts": [{
+    "status": "resolved",
+    "labels": {
+      "alertname": "PaymentApiDown",
+      "cluster": "local",
+      "instance": "http://payment-api:8000/health",
+      "job": "payment-api",
+      "replica": "prometheus-1",
+      "severity": "critical"
+    },
+    "annotations": {
+      "description": "El servicio payment-api lleva más de 1 minuto sin responder.",
+      "summary": "Payment API caída"
+    },
+    "startsAt": "2026-06-12T11:47:49.014Z",
+    "endsAt": "2026-06-12T12:09:34.014Z"
+  }],
+  "notification_reason": "all alerts resolved"
+}
+```
+
+**Bugs encontrados durante la implementación:**
+
+- `up{job="payment-api"}` no existe porque la app usa OTLP (push), no scraping
+  -> fix: añadir blackbox_exporter y usar `probe_success` en vez de `up`
+- El scrape job del blackbox con `metrics_path: /health` fallaba con
+  `received unsupported Content-Type "application/json"` porque `/health`
+  devuelve JSON, no formato Prometheus -> fix: usar el blackbox_exporter
+  correctamente con relabeling
+- Añadir `fallback_scrape_protocol: PrometheusText0.0.4` tampoco funcionó
+  porque el JSON simplemente no se parsea como Prometheus text
+- Alertmanager 0.32.2 loguea notificaciones a nivel DEBUG, no INFO -> sin
+  `--log.level=debug` parece que no envía nada cuando en realidad sí lo hace
+- `curl -X POST http://localhost:9093/-/reload` devuelve 404 si no se añade
+  `--web.enable-lifecycle` al comando de Alertmanager
+- webhook.site mostraba "Waiting for the first request" aunque las
+  notificaciones llegaban correctamente -> era un problema de la UI de
+  webhook.site, no del stack. Los logs de Alertmanager confirman los envíos:
+  `msg="Notify success" attempts=1 duration=~240ms`
+
+**URLs añadidas:**
+
+| Servicio | URL |
+|---|---|
+| Alertmanager UI | http://localhost:9093 |
+| Blackbox Exporter | http://localhost:9115 |
 
 **Para profundizar:**
 
@@ -1451,7 +1602,9 @@ y enruta al canal correcto según labels (equipo, severidad, entorno).
 |---|---|
 | Alertmanager docs | https://prometheus.io/docs/alerting/latest/alertmanager/ |
 | Alerting rules | https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/ |
-| Grafana Alerting | https://grafana.com/docs/grafana/latest/alerting/ |
+| Blackbox exporter | https://github.com/prometheus/blackbox_exporter |
+| Blackbox config | https://github.com/prometheus/blackbox_exporter/blob/master/CONFIGURATION.md |
+| Alertmanager routing | https://prometheus.io/docs/alerting/latest/configuration/#route |
 
 YouTube:
 - Canal **That DevOps Guy** (Alertmanager) -> https://www.youtube.com/@MarcelDempers/search?query=alertmanager
@@ -1462,33 +1615,117 @@ YouTube:
 ### 🔵 Fase 9: Segunda instancia de Prometheus y deduplicación real con Thanos
 
 **Concepto:** en la Fase 6 configuramos la deduplicación de Thanos con
-`replica="prometheus-1"` pero nunca la hemos probado de verdad porque solo
-hay una instancia de Prometheus. En esta fase levantamos una segunda instancia
-(`replica="prometheus-2"`) scrapeando los mismos targets y verificamos que
-Thanos Query deduplica correctamente.
+`replica="prometheus-1"` pero nunca la probamos de verdad porque solo había
+una instancia de Prometheus. En esta fase levantamos una segunda instancia
+(`replica="prometheus-2"`) scrapeando los mismos targets, configuramos el
+Collector para enviar métricas a ambas instancias, y verificamos que Thanos
+Query deduplica correctamente y que el stack sobrevive la caída de una instancia.
 
 **¿Por qué dos instancias de Prometheus?**
 
 En producción se usan dos instancias idénticas scrapeando los mismos targets
 para garantizar alta disponibilidad. Si una cae, la otra sigue recogiendo
-métricas. El problema es que Grafana vería las series duplicadas. Thanos Query
-resuelve esto: detecta que ambas instancias tienen el mismo `cluster` pero
-distinto `replica` y fusiona las series, devolviendo una sola.
+métricas. Sin Thanos, Grafana vería series duplicadas. Con Thanos Query y
+`--query.replica-label=replica`, las series con el mismo `cluster` pero
+distinto `replica` se fusionan en una sola.
 
-**Flujo con deduplicación:**
+**Flujo completo con HA:**
 ```
-Prometheus-1 {cluster="local", replica="prometheus-1"} ---> Thanos Sidecar-1 ---> MinIO
-Prometheus-2 {cluster="local", replica="prometheus-2"} ---> Thanos Sidecar-2 ---> MinIO
+OTEL Collector --remote write--> prometheus:9090   (replica=prometheus-1)
+               --remote write--> prometheus-2:9090 (replica=prometheus-2)
+
+prometheus   ---> thanos-sidecar   ---> MinIO
+prometheus-2 ---> thanos-sidecar-2 ---> MinIO
 
 Grafana --> Thanos Query --> deduplica por replica --> 1 serie limpia
+                        --> Thanos Store (histórico)
+```
+
+**Si cae `prometheus-1`:**
+```
+OTEL Collector --remote write falla--> prometheus:9090   (DOWN)
+               --remote write OK  --> prometheus-2:9090 (UP)
+
+Grafana --> Thanos Query --> thanos-sidecar (DOWN, ignorado)
+                        --> thanos-sidecar-2 (UP, sirve datos)
+                        --> Thanos Store (histórico)
+                        --> datos disponibles sin interrupción
+```
+
+**Remote write dual en el OTEL Collector:**
+
+Para que las métricas OTel sobrevivan la caída de una instancia, el Collector
+debe enviar a ambas. Se usan dos exporters con nombre compuesto:
+
+```yaml
+exporters:
+  prometheusremotewrite/p1:
+    endpoint: http://prometheus:9090/api/v1/write
+  prometheusremotewrite/p2:
+    endpoint: http://prometheus-2:9090/api/v1/write
+
+service:
+  pipelines:
+    metrics:
+      exporters: [prometheusremotewrite/p1, prometheusremotewrite/p2]
 ```
 
 **Qué se hace:**
-- Añadir `prometheus-2` con `replica: prometheus-2` en `external_labels`
-- Añadir `thanos-sidecar-2` para la segunda instancia
-- Actualizar Thanos Query con el nuevo endpoint `--endpoint=thanos-sidecar-2:10901`
-- Verificar en Grafana que no hay series duplicadas
-- Simular caída de `prometheus-1` y verificar que los dashboards siguen funcionando
+- Crear `prometheus/prometheus2.yml` con `replica: prometheus-2`
+- Añadir `prometheus-2` con volumen propio `prometheus2_data`
+- Añadir `thanos-sidecar-2` apuntando a `prometheus-2`
+- Actualizar `thanos-query` con el nuevo endpoint `--endpoint=thanos-sidecar-2:10901`
+- Actualizar `otel-collector-config.yml` con remote write dual
+- Verificar deduplicación: `Result series: 1` sin label `replica` en Grafana
+- Verificar HA: parar `prometheus-1` y confirmar que los datos siguen disponibles
+
+**Ficheros nuevos/modificados:**
+```
+prometheus/
+└── prometheus2.yml             # config segunda instancia
+docker-compose.yml              # prometheus-2, thanos-sidecar-2, volumen prometheus2_data
+                                # thanos-query con --endpoint=thanos-sidecar-2:10901
+otel-collector/
+└── otel-collector-config.yml   # prometheusremotewrite/p1 y /p2
+```
+
+**Verificación de deduplicación en Grafana:**
+
+Con ambas instancias activas, `payments_created_total` devuelve:
+- `Result series: 1` — una sola serie ✅
+- Labels: `cluster="local"` sin `replica` ✅
+- Thanos Query eliminó el label `replica` al deduplicar
+
+Sin deduplicación aparecerían dos series:
+```
+payments_created_total{cluster="local", replica="prometheus-1"} 26
+payments_created_total{cluster="local", replica="prometheus-2"} 26
+```
+
+**Verificación de HA:**
+
+```bash
+# Para prometheus-1 y su sidecar
+docker compose stop prometheus thanos-sidecar
+
+# Las métricas scrapeadas (infraestructura) siguen disponibles via prometheus-2
+curl -s "http://localhost:10902/api/v1/query?query=node_cpu_seconds_total" | \
+  python3 -m json.tool | grep value | head -2
+
+# Las métricas OTel también (gracias al remote write dual)
+curl -s "http://localhost:10902/api/v1/query?query=payments_created_total" | \
+  python3 -m json.tool | grep value
+
+# Levanta de nuevo
+docker compose start prometheus thanos-sidecar
+```
+
+**URLs añadidas:**
+
+| Servicio | URL |
+|---|---|
+| Prometheus-2 UI | http://localhost:9091 |
+| Thanos Stores | http://localhost:10902/stores (muestra 2 sidecars) |
 
 **Para profundizar:**
 
@@ -1496,6 +1733,7 @@ Grafana --> Thanos Query --> deduplica por replica --> 1 serie limpia
 |---|---|
 | Thanos HA setup | https://thanos.io/tip/thanos/quick-tutorial.md/#ha-prometheus-with-thanos |
 | Thanos deduplication | https://thanos.io/tip/thanos/query.md/#deduplication |
+| Prometheus HA | https://prometheus.io/docs/introduction/faq/#can-prometheus-be-made-highly-available |
 
 ---
 
@@ -1795,7 +2033,53 @@ curl -s --get \
 
 ---
 
-### Validación rápida post-actualización de imagen
+### Alertmanager y alertas
+
+```bash
+# Reglas cargadas y su estado
+curl -s http://localhost:9090/api/v1/rules | \
+  python3 -m json.tool | grep -E "name|state|health"
+
+# Alertas activas en Prometheus
+curl -s http://localhost:9090/api/v1/alerts | \
+  python3 -m json.tool | grep -E "alertname|state"
+
+# Prometheus ve Alertmanager
+curl -s http://localhost:9090/api/v1/alertmanagers | python3 -m json.tool
+
+# Alertas activas en Alertmanager
+curl -s http://localhost:9093/api/v2/alerts | \
+  python3 -m json.tool | grep -E "alertname|state"
+
+# Prometheus envió notificaciones sin errores
+curl -s http://localhost:9090/metrics | \
+  grep -E "prometheus_notifications_sent_total|prometheus_notifications_errors_total"
+
+# Blackbox probe de la API
+curl -s "http://localhost:9115/probe?target=http://payment-api:8000/health&module=http_2xx" | \
+  grep probe_success
+```
+
+Para probar el flujo completo:
+```bash
+# 1. Para la API
+docker compose stop api
+
+# 2. Espera 1 minuto y verifica que PaymentApiDown está firing
+curl -s http://localhost:9090/api/v1/alerts | \
+  python3 -m json.tool | grep -E "alertname|state"
+
+# 3. Verifica que Alertmanager envió el webhook (--log.level=debug en alertmanager)
+docker compose logs alertmanager | grep "Notify success"
+
+# 4. Levanta la API
+docker compose start api
+
+# 5. Verifica notificación de resolución
+docker compose logs alertmanager | grep "resolved"
+```
+
+---
 
 Cuando Dependabot abre un PR o cambias una imagen manualmente, sigue este flujo:
 

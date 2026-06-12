@@ -40,6 +40,7 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus/rules:/etc/prometheus/rules
       - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -48,6 +49,7 @@ services:
       - "--storage.tsdb.min-block-duration=2h"
       - "--storage.tsdb.max-block-duration=2h"
       - "--web.enable-remote-write-receiver"
+      - "--web.enable-lifecycle"
     restart: unless-stopped
     mem_limit: 512m
 
@@ -215,10 +217,12 @@ services:
       - --grpc-address=0.0.0.0:10901
       - --http-address=0.0.0.0:10902
       - --endpoint=thanos-sidecar:10901
+      - --endpoint=thanos-sidecar-2:10901
       - --endpoint=thanos-store:10901
       - --query.replica-label=replica
     depends_on:
       - thanos-sidecar
+      - thanos-sidecar-2
       - thanos-store
     restart: unless-stopped
     mem_limit: 128m
@@ -240,9 +244,72 @@ services:
       "
     restart: on-failure
 
+  alertmanager:
+    image: prom/alertmanager:v0.32.2
+    container_name: alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      - "--log.level=debug"
+    restart: unless-stopped
+    mem_limit: 64m
+
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.28.0
+    container_name: blackbox-exporter
+    ports:
+      - "9115:9115"
+    restart: unless-stopped
+    mem_limit: 32m
+
+  prometheus-2:
+    image: prom/prometheus:v3.12.0
+    container_name: prometheus-2
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus/prometheus2.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus/rules:/etc/prometheus/rules
+      - prometheus2_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--storage.tsdb.min-block-duration=2h"
+      - "--storage.tsdb.max-block-duration=2h"
+      - "--web.enable-remote-write-receiver"
+      - "--web.enable-lifecycle"
+    restart: unless-stopped
+    mem_limit: 512m
+
+  thanos-sidecar-2:
+    image: quay.io/thanos/thanos:v0.41.0
+    container_name: thanos-sidecar-2
+    user: "0"
+    volumes:
+      - ./thanos/bucket-config.yml:/etc/thanos/bucket-config.yml
+      - prometheus2_data:/prometheus
+    command:
+      - sidecar
+      - --tsdb.path=/prometheus
+      - --prometheus.url=http://prometheus-2:9090
+      - --objstore.config-file=/etc/thanos/bucket-config.yml
+      - --grpc-address=0.0.0.0:10901
+      - --http-address=0.0.0.0:10902
+    depends_on:
+      - prometheus-2
+      - minio
+    restart: unless-stopped
+    mem_limit: 128m
+
 volumes:
   postgres_data:
   prometheus_data:
+  prometheus2_data:
   grafana_data:
   minio_data:
   loki_wal:
