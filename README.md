@@ -1747,30 +1747,163 @@ petición de extremo a extremo.
 
 **¿Qué es el context propagation?**
 
-Cuando `payment-api` llama a otro servicio, incluye el `trace_id` y `span_id`
-en las cabeceras HTTP (`traceparent` según el estándar W3C). El segundo
-servicio lee esas cabeceras, crea un nuevo span hijo del span original y lo
-envía al mismo Collector. Grafana Tempo reconstruye el árbol completo:
+Cuando `payment-api` llama a `fraud-service`, incluye el `trace_id` y `span_id`
+actuales en la cabecera HTTP `traceparent` (estándar W3C Trace Context).
+`fraud-service` la lee, crea un span hijo con el mismo `trace_id`, y lo envía
+al mismo Collector. Tempo reconstruye el árbol completo:
 
 ```
-payment-api (span raíz)
-└── POST /payments (span)
-    └── fraud-service (span hijo en otro servicio)
-        └── db query (span nieto)
+payment-api: POST /payments (31ms)
+  └── payment.process (28ms)
+       └── fraud-service: POST /check (179µs)   <- span de otro servicio
+            └── fraud.check (47µs)
+       └── INSERT paymentsdb
+       └── SELECT paymentsdb
 ```
 
-**Qué se hace:**
-- Crear `fraud-service` en Go con el SDK de OpenTelemetry para Go
-- `payment-api` llama a `fraud-service` antes de persistir el pago
-- Ambos servicios envían trazas al mismo OTEL Collector
-- Verificar en Grafana Tempo que una sola traza muestra spans de ambos servicios
-- Correlacionar con logs de ambos servicios via `trace_id`
+**Formato W3C traceparent:**
+```
+traceparent: 00-{trace-id}-{parent-span-id}-{flags}
+             00-7f13205682da8831cd2c269f13c80c1b-4cd3cab2376d9bed-01
+```
+
+**¿Qué se hace:**
+- Crear `fraud-service/` en Go con OTel SDK, HTTP server y lógica de negocio
+- `payment-api` inyecta el contexto en los headers via `inject(headers)` e
+  invoca al fraud-service con `httpx` antes de persistir el pago
+- Pagos > 1000€ son rechazados con HTTP 422
+- `fraud-service` extrae el contexto del header `traceparent` y crea spans hijo
+- Ambos envían trazas al mismo OTEL Collector
+
+**Flujo distribuido:**
+```
+Cliente --> payment-api (Python) --traceparent header--> fraud-service (Go)
+               |                          |
+           OTLP gRPC                  OTLP gRPC
+               |                          |
+               +----------> OTEL Collector --> Tempo
+                                              (trace_id compartido)
+```
+
+**Ficheros nuevos/modificados:**
+```
+fraud-service/
+├── main.go         # HTTP server + OTel Go SDK + lógica de fraude
+├── go.mod          # dependencias Go
+└── Dockerfile      # multi-stage: golang:1.24-alpine -> alpine:3.21
+app/
+├── app.py          # añade llamada a fraud-service con propagación de contexto
+└── requirements.txt # añade httpx==0.28.1
+docker-compose.yml  # añade servicio fraud-service
+```
+
+**Propagación del contexto en Python (`app.py`):**
+
+```python
+from opentelemetry.propagate import inject
+import httpx
+
+with tracer.start_as_current_span("payment.process") as span:
+    headers = {}
+    inject(headers)  # inyecta traceparent con el trace_id actual
+    fraud_resp = httpx.post(
+        f"{fraud_url}/check",
+        json={"amount": payment.amount, "currency": payment.currency, "payment_id": ""},
+        headers=headers,
+        timeout=5.0,
+    )
+    if fraud_resp.json().get("status") == "rejected":
+        raise HTTPException(status_code=422, detail=f"Pago rechazado: {fraud_resp.json().get('reason')}")
+```
+
+**Extracción del contexto en Go (`fraud-service/main.go`):**
+
+El SDK de OTel Go (via `otel.GetTextMapPropagator().Extract()`) no extraía
+correctamente el contexto remoto del header en la versión descargada por
+`go mod tidy`. El fix fue parsear el header `traceparent` manualmente y
+crear el span context con `trace.ContextWithRemoteSpanContext`:
+
+```go
+func extractRemoteContext(ctx context.Context, r *http.Request) context.Context {
+    tp := r.Header.Get("Traceparent")
+    parts := strings.Split(tp, "-")
+    if len(parts) != 4 { return ctx }
+
+    traceID, _ := trace.TraceIDFromHex(parts[1])
+    spanID, _ := trace.SpanIDFromHex(parts[2])
+
+    sc := trace.NewSpanContext(trace.SpanContextConfig{
+        TraceID:    traceID,
+        SpanID:     spanID,
+        TraceFlags: trace.FlagsSampled,
+        Remote:     true,
+    })
+
+    return trace.ContextWithRemoteSpanContext(ctx, sc)
+}
+
+func checkHandler(w http.ResponseWriter, r *http.Request) {
+    ctx := extractRemoteContext(r.Context(), r)
+    tracer := otel.Tracer("fraud-service")
+    ctx, span := tracer.Start(ctx, "POST /check")
+    defer span.End()
+    ...
+}
+```
+
+**Dockerfile multi-stage para Go:**
+
+Sin Go instalado en el host, el build se hace completamente en Docker.
+El `go mod tidy` se ejecuta con todos los ficheros copiados para que pueda
+analizar los imports y generar el `go.sum`:
+
+```dockerfile
+FROM golang:1.24-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN go mod tidy
+RUN CGO_ENABLED=0 GOOS=linux go build -o fraud-service .
+
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates
+WORKDIR /app
+COPY --from=builder /app/fraud-service .
+EXPOSE 8001
+CMD ["./fraud-service"]
+```
 
 **¿Por qué Go?**
 
-Go es el lenguaje más común en el ecosistema de plataforma e infraestructura
-(Kubernetes, Prometheus, Grafana, Thanos están escritos en Go). Practicar OTel
-con Go es directamente aplicable al trabajo del día a día.
+Go es el lenguaje del ecosistema de plataforma e infraestructura: Kubernetes,
+Prometheus, Grafana, Thanos, Loki, Tempo y el OTEL Collector están escritos
+en Go. Practicar OTel con Go es directamente aplicable al trabajo del día a día.
+
+**Bugs encontrados durante la implementación:**
+
+- `go.mod` incluía `go.opentelemetry.io/otel/semconv/v1.26.0` como módulo
+  separado -> fix: es un paquete dentro de `go.opentelemetry.io/otel`, no
+  un módulo independiente, eliminar del `require`
+- `go mod download` no genera `go.sum` sin el `main.go` -> fix: copiar todos
+  los ficheros primero y ejecutar `go mod tidy` en vez de `go mod download`
+- `otel.GetTextMapPropagator().Extract()` devolvía contexto vacío
+  (`trace_id=000...000 valid=false`) aunque el header `traceparent` llegaba
+  correctamente -> fix: parsear el header W3C manualmente con
+  `trace.TraceIDFromHex`, `trace.SpanIDFromHex` y
+  `trace.ContextWithRemoteSpanContext`
+- `httpx` no estaba en `requirements.txt` de la app -> fix: añadir
+  `httpx==0.28.1`
+
+**Resultado en Grafana Tempo:**
+
+Una sola traza con `Services: 2` muestra el árbol completo con spans de
+`payment-api` y `fraud-service` identificados por colores distintos.
+El `trace_id` es el mismo en ambos servicios.
+
+**URLs añadidas:**
+
+| Servicio | URL |
+|---|---|
+| Fraud Service health | http://localhost:8001/health |
 
 **Para profundizar:**
 
@@ -1779,6 +1912,7 @@ con Go es directamente aplicable al trabajo del día a día.
 | OTel Go SDK | https://opentelemetry.io/docs/languages/go/ |
 | W3C Trace Context | https://www.w3.org/TR/trace-context/ |
 | Context propagation | https://opentelemetry.io/docs/concepts/context-propagation/ |
+| trace.ContextWithRemoteSpanContext | https://pkg.go.dev/go.opentelemetry.io/otel/trace#ContextWithRemoteSpanContext |
 | Distributed tracing patterns | https://opentelemetry.io/docs/concepts/signals/traces/ |
 
 YouTube:
