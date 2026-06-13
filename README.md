@@ -8,10 +8,11 @@ de pagos en FastAPI y desplegado en local con Docker.
 ## Índice
 
 1. [Objetivo](#1-objetivo)
-2. [Arquitectura final](#2-arquitectura-final)
-3. [Requisitos del sistema](#3-requisitos-del-sistema)
-4. [Estructura del proyecto](#4-estructura-del-proyecto)
-5. [Itinerario de fases](#5-itinerario-de-fases)
+2. [Conceptos fundamentales de observabilidad](#2-conceptos-fundamentales)
+3. [Arquitectura final](#3-arquitectura-final)
+4. [Requisitos del sistema](#4-requisitos-del-sistema)
+5. [Estructura del proyecto](#5-estructura-del-proyecto)
+6. [Itinerario de fases](#6-itinerario-de-fases)
    - [Fase 1: La API](#-fase-1-la-api)
    - [Fase 2: Métricas con Prometheus y Grafana](#-fase-2-métricas-con-prometheus-y-grafana)
    - [Fase 3: Logs estructurados con Loki](#-fase-3-logs-estructurados-con-loki)
@@ -22,13 +23,16 @@ de pagos en FastAPI y desplegado en local con Docker.
    - [Fase 8: Alertas con Prometheus Alertmanager](#-fase-8-alertas-con-prometheus-alertmanager)
    - [Fase 9: Segunda instancia de Prometheus y deduplicación real con Thanos](#-fase-9-segunda-instancia-de-prometheus-y-deduplicación-real-con-thanos)
    - [Fase 10: Segundo servicio y trazas distribuidas](#-fase-10-segundo-servicio-y-trazas-distribuidas)
-6. [Correlación entre las tres señales](#6-correlacion-entre-las-tres-senales)
-7. [Métricas expuestas por la API](#7-metricas-expuestas-por-la-api)
-8. [Campos de log](#8-campos-de-log)
-9. [Notas importantes](#9-notas-importantes)
-10. [Dependabot](#10-dependabot)
-11. [Validaciones del stack](#11-validaciones)
-12. [Referencias](#12-referencias)
+7. [Correlación entre las tres señales](#7-correlacion-entre-las-tres-senales)
+8. [Métricas expuestas por la API](#8-metricas-expuestas-por-la-api)
+9. [Campos de log](#9-campos-de-log)
+10. [Notas importantes](#10-notas-importantes)
+11. [Dependabot](#11-dependabot)
+12. [Validaciones del stack](#12-validaciones)
+13. [Errores conceptuales comunes (gotchas)](#13-gotchas)
+14. [Preguntas de entrevista](#14-preguntas-entrevista)
+15. [Glosario](#15-glosario)
+16. [Referencias](#16-referencias)
 
 ---
 
@@ -44,8 +48,168 @@ trazas, retención histórica y visualización.
 
 ---
 
-<a name="2-arquitectura-final"></a>
-## 🏗️ 2. Arquitectura final
+---
+
+<a name="2-conceptos-fundamentales"></a>
+## 🧠 2. Conceptos fundamentales de observabilidad
+
+Antes de las herramientas, las ideas. Esta sección es la base teórica que
+sostiene todo lo que se construye en las fases. Si entiendes esto, las
+herramientas concretas (Prometheus, Loki, Tempo) son solo implementaciones
+intercambiables de los mismos conceptos.
+
+### Monitorización vs Observabilidad
+
+No son lo mismo aunque se usen como sinónimos.
+
+**Monitorización** responde a preguntas que sabías de antemano que ibas a
+hacer: "¿está la CPU por encima del 80%?", "¿responde el endpoint /health?".
+Defines dashboards y alertas sobre fallos conocidos.
+
+**Observabilidad** es la capacidad de hacer preguntas que no anticipaste, sin
+desplegar código nuevo. "¿Por qué este pago concreto de este cliente tardó
+3 segundos un martes a las 14:32?". Requiere datos suficientemente ricos
+(alta cardinalidad, contexto, correlación) para investigar lo desconocido.
+
+La diferencia práctica: la monitorización te dice QUE algo falla, la
+observabilidad te ayuda a entender POR QUÉ.
+
+### Los tres pilares (the three pillars)
+
+| Pilar | Pregunta que responde | Herramienta aquí | Naturaleza |
+|---|---|---|---|
+| **Métricas** | ¿Cuánto? ¿Con qué frecuencia? ¿Cuán rápido? | Prometheus | Números agregados en el tiempo, baratos de almacenar |
+| **Logs** | ¿Qué pasó exactamente en este evento? | Loki | Eventos discretos con detalle, caros si hay volumen |
+| **Trazas** | ¿Por dónde pasó esta petición y cuánto tardó en cada salto? | Tempo | El camino de una petición a través de servicios |
+
+La clave no es tener los tres por separado, sino **correlacionarlos**. Una
+métrica te avisa de latencia alta, el `exemplar` de esa métrica te lleva a una
+traza concreta, la traza tiene un `trace_id` que te lleva a los logs exactos
+de esa petición. Eso es lo que se monta en la [sección de correlación](#7-correlacion-entre-las-tres-senales).
+
+### Los signals de OpenTelemetry
+
+OpenTelemetry (OTel) es el estándar vendor-neutral que unifica cómo se generan
+y exportan los datos de telemetría. Define varios "signals":
+
+- **Traces**: trazas distribuidas (estable)
+- **Metrics**: métricas (estable)
+- **Logs**: logs (estable, con bridge desde librerías existentes como structlog)
+- **Profiles**: profiling continuo de CPU/memoria (más reciente)
+
+La promesa de OTel: instrumentas tu código una sola vez con el SDK de OTel, y
+puedes cambiar el backend (Tempo por Jaeger, Prometheus por Mimir) sin tocar
+la app. Solo cambias la config del Collector. Este proyecto lo demuestra en la
+Fase 5.
+
+### Pull vs Push
+
+Dos modelos opuestos de recolección de métricas:
+
+**Pull (Prometheus)**: el servidor va a buscar las métricas scrapeando un
+endpoint `/metrics` de cada target cada X segundos. Ventajas: el servidor
+controla el ritmo, detecta fácilmente si un target está caído (`up=0`),
+configuración centralizada. Es el modelo de Prometheus, Node Exporter, etc.
+
+**Push (OTLP)**: la app envía activamente sus datos a un Collector. Ventajas:
+funciona con trabajos efímeros (batch jobs que mueren antes de ser scrapeados),
+no requiere que el servidor alcance a la app por red. Es el modelo de OTel,
+StatsD, etc.
+
+Este proyecto usa **ambos**: la app empuja métricas via OTLP al Collector
+(push), pero Prometheus scrapea los exporters de infraestructura directamente
+(pull). La razón de no unificar todo en push está documentada en la Fase 5:
+el pipeline `prometheus receiver -> prometheusremotewrite` rompe la semántica
+de los counters y `rate()` deja de funcionar.
+
+### Cardinalidad: el concepto que más cuesta dinero
+
+La **cardinalidad** es el número de series temporales únicas que genera una
+métrica. Cada combinación distinta de labels crea una serie nueva.
+
+```
+http_requests_total{method="GET", status="200"}   <- serie 1
+http_requests_total{method="GET", status="404"}   <- serie 2
+http_requests_total{method="POST", status="200"}  <- serie 3
+```
+
+Con 4 métodos x 5 status = 20 series. Manejable. Pero si añades un label de
+alta cardinalidad como `user_id`:
+
+```
+http_requests_total{method="GET", status="200", user_id="..."}
+```
+
+Con 1 millón de usuarios, esa métrica genera 4 x 5 x 1.000.000 = 20 millones
+de series. Eso revienta Prometheus en memoria y disco.
+
+**Regla de oro**: los labels deben tener cardinalidad acotada y baja
+(método, status, región, tipo). Nunca uses como label: user_id, email, IP,
+trace_id, timestamp, request_id. Esos detalles de alta cardinalidad van en
+**logs o trazas**, no en métricas. Confundir esto es el error más caro y común
+en observabilidad.
+
+### RED y USE: dos métodos para saber qué medir
+
+No midas todo porque sí. Hay dos frameworks que te dicen qué métricas importan.
+
+**RED method** (para servicios, lo que pide un usuario):
+- **R**ate: peticiones por segundo
+- **E**rrors: peticiones que fallan por segundo
+- **D**uration: distribución de latencia (p50, p99)
+
+En este proyecto: `payments_created_total` (rate), errores HTTP 422/5xx
+(errors), `payments_amount_euros` y `http.server.request.duration` (duration).
+
+**USE method** (para recursos, lo que consume el sistema):
+- **U**tilization: porcentaje de uso (CPU, memoria, disco)
+- **S**aturation: cuánto trabajo en cola que no se puede atender
+- **E**rrors: errores del recurso
+
+En este proyecto: lo cubren Node Exporter (host), cAdvisor (contenedores) y
+postgres_exporter (base de datos).
+
+Regla práctica: RED para tus servicios, USE para tu infraestructura.
+
+### SLI, SLO, SLA
+
+Tres siglas que se confunden constantemente:
+
+- **SLI** (Indicator): la métrica concreta que mides. "Porcentaje de peticiones
+  que responden en menos de 300ms".
+- **SLO** (Objective): el objetivo interno sobre ese SLI. "99.5% de las
+  peticiones bajo 300ms en 30 días".
+- **SLA** (Agreement): el contrato con el cliente y sus penalizaciones si no
+  se cumple. "Si bajamos del 99.5%, devolvemos el 10% de la factura".
+
+El SLO es la herramienta de trabajo del SRE. De él sale el **error budget**:
+si tu SLO es 99.5%, tienes un 0.5% de "presupuesto de error" que puedes gastar
+en despliegues arriesgados o mantenimiento. Cuando se agota, se congelan los
+cambios y se prioriza estabilidad.
+
+### Cómo encaja todo en este proyecto
+
+```
+Instrumentación (OTel SDK en la app)
+        |
+   Recolección (push OTLP + pull scraping)
+        |
+   Procesamiento y routing (OTEL Collector)
+        |
+   Almacenamiento (Prometheus/Thanos, Loki, Tempo -> MinIO)
+        |
+   Visualización y correlación (Grafana)
+        |
+   Alertas (Prometheus rules -> Alertmanager)
+```
+
+Cada fase del proyecto añade una pieza de esta cadena. Tenerla entera en la
+cabeza ayuda a ubicar cada herramienta en su sitio.
+
+---
+
+<a name="3-arquitectura-final"></a>
+## 🏗️ 3. Arquitectura final
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -83,8 +247,8 @@ trazas, retención histórica y visualización.
 
 ---
 
-<a name="3-requisitos-del-sistema"></a>
-## 🖥️ 3. Requisitos del sistema
+<a name="4-requisitos-del-sistema"></a>
+## 🖥️ 4. Requisitos del sistema
 
 | Recurso | Mínimo | Probado con |
 |---|---|---|
@@ -105,8 +269,8 @@ python3 --version
 
 ---
 
-<a name="4-estructura-del-proyecto"></a>
-## 📁 4. Estructura del proyecto
+<a name="5-estructura-del-proyecto"></a>
+## 📁 5. Estructura del proyecto
 
 ```
 fastapi-observability/
@@ -123,7 +287,9 @@ fastapi-observability/
 │       └── test_api.py
 │
 ├── prometheus/
-│   └── prometheus.yml            # Config scraping (Fase 2)
+│   ├── prometheus.yml            # Config scraping (Fase 2)
+│   └── rules/
+│       └── payment-api.yml       # Reglas de alerta (Fase 8)
 │
 ├── grafana/
 │   ├── provisioning/
@@ -145,19 +311,21 @@ fastapi-observability/
 │   └── otel-collector-config.yml # Pipeline unificado (Fase 5)
 │
 ├── loki/
-│   └── loki-config.yml           # Config Loki (Fase 3)
-│
-├── promtail/
-│   └── promtail-config.yml       # Config Promtail (Fase 3)
+│   └── loki-config.yml           # Config Loki, backend S3/MinIO (Fase 3, 7)
 │
 ├── tempo/
-│   └── tempo-config.yml          # Config Tempo (Fase 4)
+│   └── tempo-config.yml          # Config Tempo, backend S3/MinIO (Fase 4, 7)
 │
 ├── thanos/
 │   └── bucket-config.yml         # Config MinIO/S3 (Fase 6)
 │
-├── scripts/
-│   └── load_test.sh              # Genera tráfico simulado
+├── alertmanager/
+│   └── alertmanager.yml          # Config enrutamiento de alertas (Fase 8)
+│
+├── fraud-service/
+│   ├── main.go                   # Servicio Go con OTel (Fase 10)
+│   ├── go.mod
+│   └── Dockerfile
 │
 ├── docker-compose.yml            # Crece fase a fase
 ├── .github/
@@ -170,8 +338,8 @@ fastapi-observability/
 
 ---
 
-<a name="5-itinerario-de-fases"></a>
-## 🗺️ 5. Itinerario de fases
+<a name="6-itinerario-de-fases"></a>
+## 🗺️ 6. Itinerario de fases
 
 ---
 
@@ -372,6 +540,17 @@ curl -i -X POST http://localhost:8000/payments \
   -d '{"currency": "EUR"}'
 ```
 
+
+**Conceptos que afianzas aquí:**
+
+Antes de poder observar algo, ese algo tiene que existir y comportarse de forma
+realista. Esta fase fija la idea de que la observabilidad se construye sobre un
+servicio con estado (base de datos, endpoints, errores posibles), no sobre un
+"hola mundo". El patrón de health endpoint (`/health`) que creas aquí es el
+mismo que luego usan Kubernetes (liveness/readiness probes) y el blackbox
+exporter (Fase 8) para decidir si el servicio está vivo. Aprendes que la
+instrumentación empieza por diseñar la app para que sea observable.
+
 ---
 
 ### 🔵 Fase 2: Métricas con Prometheus y Grafana
@@ -521,6 +700,16 @@ YouTube:
 - Canal **TechWorld with Nana** (Node Exporter) -> https://www.youtube.com/@TechWorldwithNana/search?query=node+exporter
 - Canal **That DevOps Guy** (Prometheus exporters) -> https://www.youtube.com/@MarcelDempers/search?query=prometheus+exporter
 
+
+**Conceptos que afianzas aquí:**
+
+Aquí interiorizas el modelo pull de Prometheus: el servidor va a buscar las
+métricas a un endpoint, no al revés. Entiendes la diferencia entre los tipos de
+métrica (Counter que solo sube, Gauge que oscila, Histogram que distribuye en
+buckets) y por qué `rate()` solo tiene sentido sobre counters. Empiezas a notar
+el peso de la cardinalidad: cada label que añades multiplica las series. Es el
+primer pilar (métricas) y el método RED aplicado a un servicio real de pagos.
+
 ---
 
 ### 🟡 Fase 3: Logs estructurados con Loki
@@ -628,6 +817,16 @@ YouTube:
 - Canal **Grafana** (Loki) -> https://www.youtube.com/@Grafana/search?query=loki
 - Canal **TechWorld with Nana** (Loki) -> https://www.youtube.com/@TechWorldwithNana/search?query=loki
 - Canal **That DevOps Guy** (Loki) -> https://www.youtube.com/@MarcelDempers/search?query=loki
+
+
+**Conceptos que afianzas aquí:**
+
+El salto mental clave es entender por qué un log estructurado (JSON con campos)
+es infinitamente más útil que una línea de texto plano: puedes filtrar y agregar
+por campo. Comprendes el modelo de Loki, que no indexa el contenido del log sino
+solo unos pocos labels (de baja cardinalidad, igual que en métricas), lo que lo
+hace barato. Este es el segundo pilar (logs) y aquí plantas la semilla de la
+correlación al empezar a incluir el `trace_id` en cada log.
 
 ---
 
@@ -821,6 +1020,16 @@ YouTube:
 - Canal **opentelemetry** oficial -> https://www.youtube.com/@otel-official/search?query=python
 - Canal **Grafana** (Tempo) -> https://www.youtube.com/@Grafana/search?query=tempo
 - Canal **That DevOps Guy** (OpenTelemetry) -> https://www.youtube.com/@MarcelDempers/search?query=opentelemetry
+
+
+**Conceptos que afianzas aquí:**
+
+Esta fase fija el concepto de traza y span: una petición es un árbol de
+operaciones con tiempos, no un evento plano. Entiendes el rol del SDK de
+OpenTelemetry como capa de instrumentación vendor-neutral, y la diferencia entre
+auto-instrumentación (FastAPI, SQLAlchemy) e instrumentación manual (tus propios
+spans). Es el tercer pilar (trazas) y el momento en que el `trace_id` se
+convierte en el hilo que cose métricas, logs y trazas.
 
 ---
 
@@ -1077,6 +1286,17 @@ YouTube:
 - Canal **opentelemetry** oficial (Collector) -> https://www.youtube.com/@otel-official/search?query=collector
 - Canal **Anton Putra** (OTEL Collector) -> https://www.youtube.com/@AntonPutra/search?query=opentelemetry+collector
 
+
+**Conceptos que afianzas aquí:**
+
+El concepto transferible es el del Collector como punto único de
+recepción/procesamiento/routing: instrumentas la app una vez y decides el
+destino en la config, sin tocar código. Aquí vives en carne propia por qué push
+(OTLP) y pull (scraping) conviven y no se mezclan a la ligera: descubres que
+meter counters por un pipeline equivocado rompe `rate()`. Entiendes que el
+Collector desacopla la app de los backends concretos, que es la promesa central
+de OpenTelemetry.
+
 ---
 
 ### 🔴 Fase 6: Retención larga con Thanos y MinIO
@@ -1261,6 +1481,16 @@ YouTube:
 - Canal **That DevOps Guy** (Thanos) -> https://www.youtube.com/@MarcelDempers/search?query=thanos
 - Canal **Grafana** (Thanos) -> https://www.youtube.com/@Grafana/search?query=thanos
 
+
+**Conceptos que afianzas aquí:**
+
+Aquí aprendes el patrón sidecar (un proceso que acompaña a otro para extenderlo)
+y la separación entre almacenamiento caliente (disco local, rápido, caro, poco
+tiempo) y frío (object storage S3, lento, barato, retención larga). Entiendes
+que Prometheus no está pensado para guardar años de datos y que la solución no
+es un disco más grande, sino delegar en almacenamiento de objetos. Es la base de
+cómo escalan en retención Thanos, Mimir y Cortex.
+
 ---
 
 ### 🟤 Fase 7: Storage persistente para Loki y Tempo en MinIO
@@ -1411,6 +1641,16 @@ en MinIO y sobreviven reinicios del stack completo.
 | Loki ingester config | https://grafana.com/docs/loki/latest/configure/#ingester |
 | Tempo S3 storage | https://grafana.com/docs/tempo/latest/configuration/s3/ |
 | Loki WAL | https://grafana.com/docs/loki/latest/operations/storage/wal/ |
+
+
+**Conceptos que afianzas aquí:**
+
+Refuerzas la idea de durabilidad: el WAL (Write-Ahead Log) protege los datos en
+vuelo ante una caída antes de que lleguen al almacenamiento definitivo. Entiendes
+que persistencia y retención son problemas distintos, y que dar a las tres
+señales el mismo backend de object storage (MinIO) unifica la gestión. También
+ves que la API S3 es el estándar de facto: el mismo concepto sirve para AWS S3,
+MinIO, Ceph o R2 cambiando solo el endpoint.
 
 ---
 
@@ -1610,6 +1850,16 @@ YouTube:
 - Canal **That DevOps Guy** (Alertmanager) -> https://www.youtube.com/@MarcelDempers/search?query=alertmanager
 - Canal **Grafana** (Alerting) -> https://www.youtube.com/@Grafana/search?query=alerting
 
+
+**Conceptos que afianzas aquí:**
+
+La idea central es la separación de responsabilidades: Prometheus detecta
+(evalúa reglas), Alertmanager decide qué hacer (agrupa, silencia, inhibe,
+enruta). Aprendes que `up` no es salud real y por qué hace falta el blackbox
+exporter para probar un endpoint que usa push. Internalizas conceptos de gestión
+de alertas (group_wait, repeat_interval, inhibición) que existen para combatir
+la fatiga de alertas, el enemigo silencioso de cualquier equipo de guardia.
+
 ---
 
 ### 🔵 Fase 9: Segunda instancia de Prometheus y deduplicación real con Thanos
@@ -1734,6 +1984,16 @@ docker compose start prometheus thanos-sidecar
 | Thanos HA setup | https://thanos.io/tip/thanos/quick-tutorial.md/#ha-prometheus-with-thanos |
 | Thanos deduplication | https://thanos.io/tip/thanos/query.md/#deduplication |
 | Prometheus HA | https://prometheus.io/docs/introduction/faq/#can-prometheus-be-made-highly-available |
+
+
+**Conceptos que afianzas aquí:**
+
+Esta fase fija el concepto de alta disponibilidad por redundancia: dos
+Prometheus scrapeando lo mismo, y deduplicación por el label `replica` para que
+el usuario vea una sola serie. Entiendes que la deduplicación es lo que hace
+viable correr réplicas sin duplicar todo en los dashboards. Es el patrón que
+sostiene cualquier despliegue serio de Prometheus en producción, donde perder
+métricas durante un reinicio no es aceptable.
 
 ---
 
@@ -1919,10 +2179,21 @@ YouTube:
 - Canal **opentelemetry** oficial (Go) -> https://www.youtube.com/@otel-official/search?query=go
 - Canal **Grafana** (distributed tracing) -> https://www.youtube.com/@Grafana/search?query=distributed+tracing
 
+
+**Conceptos que afianzas aquí:**
+
+Aquí cierras el círculo de las trazas distribuidas: entiendes el context
+propagation y el estándar W3C `traceparent` como el mecanismo que cose una
+petición a través de servicios y lenguajes distintos (Python y Go compartiendo
+un `trace_id`). Aprendes que la instrumentación cruza fronteras de lenguaje
+gracias a un protocolo común, y vives de primera mano que los detalles de
+implementación importan (el bug de extracción de contexto). Es el concepto que
+hace observable una arquitectura de microservicios real.
+
 ---
 
-<a name="6-correlacion-entre-las-tres-senales"></a>
-## 🔗 6. Correlación entre las tres señales
+<a name="7-correlacion-entre-las-tres-senales"></a>
+## 🔗 7. Correlación entre las tres señales
 
 El campo `trace_id` es el hilo conductor de las 3 señales en Grafana:
 
@@ -1938,21 +2209,35 @@ El campo `trace_id` es el hilo conductor de las 3 señales en Grafana:
 
 ---
 
-<a name="7-metricas-expuestas-por-la-api"></a>
-## 📊 7. Métricas expuestas por la API (Fase 2 en adelante)
+<a name="8-metricas-expuestas-por-la-api"></a>
+## 📊 8. Métricas expuestas por la API
+
+**Fases 2-4** (via `prometheus-fastapi-instrumentator` + `prometheus_client`, endpoint `/metrics`):
 
 | Métrica | Tipo | Descripción |
 |---|---|---|
 | `http_requests_total` | Counter | Requests por endpoint y status (auto) |
 | `http_request_duration_seconds` | Histogram | Latencia HTTP (auto) |
 | `payments_created_total` | Counter | Pagos creados por moneda (custom) |
-| `payments_failed_total` | Counter | Pagos fallidos por motivo (custom) |
 | `payments_amount_euros` | Histogram | Distribución de importes (custom) |
+
+**Fase 5 en adelante** (via OTel metrics SDK + OTLP al Collector + remote write a Prometheus):
+
+| Métrica | Tipo | Labels | Descripción |
+|---|---|---|---|
+| `payments_created_total` | Counter | `currency`, `job`, `otel_scope_name` | Pagos creados (custom) |
+| `payments_amount_euros` | Histogram | `currency`, `job`, `otel_scope_name` | Distribución de importes (custom) |
+| `http.server.request.duration` | Histogram | `http.method`, `http.route`, `http.status_code` | Latencia HTTP (auto via FastAPIInstrumentor) |
+
+El endpoint `/metrics` desaparece en la Fase 5. Las métricas se envían via OTLP
+al Collector, que las reenvía a Prometheus via remote write. La métrica
+`payments_created_total` aparece en Prometheus con labels adicionales `job`
+(derivado de `service.name`) y `otel_scope_name` (el módulo que crea el meter).
 
 ---
 
-<a name="8-campos-de-log"></a>
-## 🏷️ 8. Campos de log (Fase 3 en adelante)
+<a name="9-campos-de-log"></a>
+## 🏷️ 9. Campos de log (Fase 3 en adelante)
 
 ```json
 {
@@ -1973,8 +2258,8 @@ El campo `trace_id` es el hilo conductor de las 3 señales en Grafana:
 
 ---
 
-<a name="9-notas-importantes"></a>
-## ⚠️ 9. Notas importantes
+<a name="10-notas-importantes"></a>
+## ⚠️ 10. Notas importantes
 
 - **Cada fase es acumulativa**: el `docker-compose.yml` crece en cada fase añadiendo servicios.
 - **Todos los contenedores tienen `mem_limit`**: para no comprometer los 16 GB del equipo.
@@ -1982,8 +2267,8 @@ El campo `trace_id` es el hilo conductor de las 3 señales en Grafana:
 
 ---
 
-<a name="10-dependabot"></a>
-## 🤖 10. Dependabot
+<a name="11-dependabot"></a>
+## 🤖 11. Dependabot
 
 Dependabot revisa automáticamente las dependencias del proyecto cada semana y abre
 Pull Requests cuando hay versiones nuevas disponibles. Está configurado en
@@ -2007,8 +2292,8 @@ y actualizarlas a mano cuando se actualice la imagen principal de PostgreSQL.
 
 ---
 
-<a name="11-validaciones"></a>
-## ✅ 11. Validaciones del stack
+<a name="12-validaciones"></a>
+## ✅ 12. Validaciones del stack
 
 Este apartado recoge los comandos de validación del stack completo. Úsalos
 siempre que actualices una imagen, mergees un PR de Dependabot, o simplemente
@@ -2247,8 +2532,192 @@ docker compose up -d --force-recreate <servicio>  # con la imagen anterior en do
 
 ---
 
-<a name="12-referencias"></a>
-## 📚 12. Referencias
+<a name="13-gotchas"></a>
+## 🐛 13. Errores conceptuales comunes (gotchas)
+
+Errores de comprensión que casi todo el mundo comete al aprender observabilidad.
+Identificarlos ahorra horas de debugging y malas decisiones de diseño.
+
+### Meter alta cardinalidad en labels de métricas
+
+El error más caro. Poner `user_id`, `trace_id`, `email`, `IP` o `request_id`
+como label de una métrica de Prometheus. Cada valor único crea una serie
+temporal nueva y revienta la memoria del servidor. Esos datos van en logs o
+trazas, nunca en labels de métricas. Si necesitas correlacionar una métrica
+con una petición concreta, eso son los `exemplars`, no un label.
+
+### Confundir logs con trazas
+
+Un log es un evento puntual ("pago creado, id=X"). Una traza es el recorrido
+completo de una petición a través de servicios, con tiempos por salto. No
+intentes reconstruir el flujo de una petición leyendo logs y correlacionando
+timestamps a mano: para eso existen las trazas. Y al revés, no metas en una
+traza el detalle textual de cada cosa que pasa: para eso están los logs.
+Se complementan via `trace_id`.
+
+### Pensar que más datos = mejor observabilidad
+
+Loguear todo a nivel DEBUG en producción, crear cientos de métricas "por si
+acaso", trazar el 100% de las peticiones. El resultado es coste alto, señal
+ahogada en ruido y queries lentas. La observabilidad útil es la que responde
+preguntas, no la que acumula datos. Empieza por RED y USE, añade lo demás
+cuando una pregunta concreta lo exija.
+
+### Creer que el sampling de trazas pierde información crítica
+
+Por miedo se trazan todas las peticiones. En volumen alto eso es carísimo y
+casi nunca necesario. El tail-based sampling permite quedarte solo con las
+trazas interesantes (errores, latencia alta) descartando las que salieron bien
+y rápido. Una traza de una petición exitosa de 20ms número 4 millones aporta
+poco.
+
+### Olvidar que `rate()` necesita counters monótonos
+
+`rate()` y `increase()` en Prometheus asumen que el counter solo sube (y
+detectan reinicios a cero). Si un pipeline rompe esa propiedad (como
+`prometheus receiver -> prometheusremotewrite` en el Collector, documentado en
+la Fase 5), los cálculos de tasa dan valores absurdos. Por eso en este proyecto
+los exporters de infraestructura los scrapea Prometheus directamente.
+
+### Asumir que un dashboard verde significa que todo va bien
+
+Un dashboard solo muestra lo que decidiste medir. Si no tienes un panel para
+un modo de fallo, ese fallo es invisible aunque el dashboard esté todo verde.
+La observabilidad (a diferencia de la monitorización) sirve precisamente para
+investigar lo que no anticipaste medir.
+
+### Tratar el p99 como "el peor caso"
+
+El p99 significa que 1 de cada 100 peticiones es peor que ese valor. Con
+millones de peticiones, ese 1% son miles de usuarios con mala experiencia.
+El promedio (`avg`) miente aún más: oculta los outliers que son justo los que
+importan. Mira percentiles altos (p95, p99, p999), no medias.
+
+### Confundir `up` con salud real del servicio
+
+`up=1` solo significa que Prometheus pudo scrapear el endpoint. No significa
+que el servicio funcione correctamente, solo que responde. Un servicio puede
+tener `up=1` y estar devolviendo 500 a todos los pagos. Por eso en la Fase 8
+se alerta sobre `probe_success` del blackbox y sobre tasas de error, no solo
+sobre `up`.
+
+---
+
+<a name="14-preguntas-entrevista"></a>
+## 🎯 14. Preguntas de entrevista
+
+Preguntas típicas de entrevistas SRE/Platform/DevOps sobre observabilidad, con
+pistas de respuesta. Construir este proyecto te da material real para
+responderlas con ejemplos concretos.
+
+**¿Cuál es la diferencia entre monitorización y observabilidad?**
+Monitorización responde preguntas conocidas de antemano (dashboards y alertas
+sobre fallos previstos). Observabilidad permite investigar lo desconocido sin
+desplegar código, gracias a datos ricos y correlacionados. Monitorización =
+qué falla, observabilidad = por qué.
+
+**¿Qué son los tres pilares y cómo se correlacionan?**
+Métricas (cuánto/cuán rápido), logs (qué pasó en un evento), trazas (recorrido
+de una petición). Se correlacionan via `trace_id`: una métrica con exemplar
+lleva a una traza, la traza lleva a los logs exactos de esa petición.
+
+**¿Por qué es peligrosa la alta cardinalidad? Da un ejemplo.**
+Cada combinación de labels crea una serie temporal. Un label como `user_id`
+con millones de valores genera millones de series y revienta Prometheus en
+memoria/disco. Ejemplo: `http_requests_total{user_id="..."}`. Solución: esos
+datos van en logs o trazas, no en labels.
+
+**Diferencia entre pull y push. ¿Cuándo usar cada uno?**
+Pull (Prometheus scrapea `/metrics`): el servidor controla el ritmo, detecta
+caídas con `up`, ideal para servicios estables. Push (OTLP al Collector): la
+app envía sus datos, ideal para trabajos efímeros que mueren antes de ser
+scrapeados. Se pueden combinar.
+
+**¿Qué es RED? ¿Y USE? ¿Cuándo usar cada uno?**
+RED (Rate, Errors, Duration) para servicios de cara al usuario. USE
+(Utilization, Saturation, Errors) para recursos de infraestructura. RED te
+dice si los usuarios sufren, USE te dice qué recurso es el cuello de botella.
+
+**Explica SLI, SLO, SLA y error budget.**
+SLI es la métrica (% de peticiones bajo 300ms). SLO es el objetivo interno
+(99.5% en 30 días). SLA es el contrato con penalizaciones. El error budget es
+el margen de fallo que permite el SLO (0.5%): se gasta en despliegues
+arriesgados; cuando se agota, se congela el cambio.
+
+**¿Cómo funciona el context propagation en trazas distribuidas?**
+El servicio origen inyecta `trace_id` y `span_id` en la cabecera HTTP
+`traceparent` (W3C). El servicio destino la extrae, crea un span hijo con el
+mismo `trace_id`, y lo envía al backend. Así una sola traza recorre varios
+servicios. En este proyecto se implementó entre payment-api (Python) y
+fraud-service (Go).
+
+**¿Por qué separar Prometheus de Alertmanager?**
+Prometheus decide cuándo una alerta existe (evalúa reglas). Alertmanager decide
+qué hacer con ella (agrupar, silenciar, inhibir, enrutar). Esa separación
+permite gestionar la fatiga de alertas sin tocar las reglas de detección.
+
+**¿Cómo darías retención larga a Prometheus sin que explote en disco?**
+Prometheus local guarda poco tiempo (días). Para retención larga se usa Thanos
+(o Mimir/Cortex): un sidecar sube los bloques TSDB a object storage S3, y
+Thanos Store los sirve para queries históricas. El almacenamiento barato (S3)
+sustituye al disco local caro.
+
+**¿Cómo evitas perder métricas en una topología de Prometheus en HA?**
+Dos instancias de Prometheus scrapeando los mismos targets, cada una con un
+label `replica` distinto. Thanos Query deduplica por ese label, mostrando una
+sola serie aunque internamente haya dos. Si una instancia cae, la otra cubre
+el hueco. Implementado en la Fase 9.
+
+**¿Qué es un exemplar?**
+Un puntero desde un punto concreto de una métrica (por ejemplo, un bucket de
+histograma de latencia) a una traza específica que contribuyó a ese valor.
+Es el pegamento que conecta métricas con trazas sin meter alta cardinalidad.
+
+---
+
+<a name="15-glosario"></a>
+## 📖 15. Glosario
+
+| Término | Definición |
+|---|---|
+| **Agregación** | Combinar muchos puntos de datos en uno (sum, avg, rate) para reducir volumen y ver tendencias |
+| **Alertmanager** | Componente que recibe alertas de Prometheus y gestiona agrupación, silenciado, inhibición y enrutamiento |
+| **Cardinalidad** | Número de series temporales únicas que genera una métrica (una por cada combinación de labels) |
+| **Cardinalidad alta** | Labels con muchos valores posibles (user_id, IP); peligrosa porque multiplica las series |
+| **Chunk** | Bloque comprimido de logs (Loki) o de datos de serie temporal, unidad de almacenamiento |
+| **Counter** | Métrica que solo incrementa (peticiones totales); se consulta con rate()/increase() |
+| **Context propagation** | Pasar el contexto de traza (trace_id, span_id) entre servicios via cabeceras como traceparent |
+| **Deduplicación** | Eliminar series duplicadas que vienen de réplicas distintas de Prometheus (Thanos por label replica) |
+| **Error budget** | Margen de fallo permitido por un SLO; se gasta en riesgo y, agotado, congela cambios |
+| **Exemplar** | Puntero desde un punto de una métrica a una traza concreta que contribuyó a ese valor |
+| **Exporter** | Proceso que expone métricas de un sistema en formato Prometheus (node_exporter, postgres_exporter) |
+| **Gauge** | Métrica que sube y baja (temperatura, memoria usada, conexiones activas) |
+| **Histogram** | Métrica que distribuye observaciones en buckets; permite calcular percentiles (latencia) |
+| **Instrumentación** | Añadir código (o auto-instrumentación) que genera telemetría desde la aplicación |
+| **Label** | Par clave-valor que dimensiona una métrica (method="GET"); su cardinalidad importa mucho |
+| **OTLP** | OpenTelemetry Protocol, el formato/protocolo estándar para enviar telemetría (gRPC o HTTP) |
+| **Pull** | Modelo donde el servidor va a buscar las métricas scrapeando endpoints (Prometheus) |
+| **Push** | Modelo donde la app envía activamente su telemetría a un colector (OTLP) |
+| **Percentil (p50, p99)** | Valor bajo el cual cae ese porcentaje de observaciones; p99=300ms significa 1% peor que 300ms |
+| **RED** | Rate, Errors, Duration: las tres métricas clave de un servicio de cara al usuario |
+| **Remote write** | Mecanismo de Prometheus para enviar métricas a un almacenamiento remoto |
+| **Sampling** | Quedarse con una fracción de las trazas para reducir coste (head-based o tail-based) |
+| **Scrape** | Acción de Prometheus de ir a buscar las métricas a un endpoint /metrics |
+| **Sidecar** | Contenedor que acompaña a otro para añadirle capacidades (Thanos Sidecar junto a Prometheus) |
+| **Signal** | Cada tipo de telemetría en OpenTelemetry: traces, metrics, logs, profiles |
+| **SLI / SLO / SLA** | Indicador medido / objetivo interno / contrato con cliente |
+| **Span** | Unidad de trabajo dentro de una traza (una operación con inicio, fin y atributos) |
+| **TSDB** | Time Series Database, el motor de almacenamiento de Prometheus optimizado para series temporales |
+| **Trace / Traza** | Recorrido completo de una petición a través de uno o varios servicios |
+| **trace_id** | Identificador único que comparten todos los spans y logs de una misma petición |
+| **traceparent** | Cabecera HTTP del estándar W3C que transporta el contexto de traza entre servicios |
+| **USE** | Utilization, Saturation, Errors: las tres métricas clave de un recurso de infraestructura |
+| **WAL** | Write-Ahead Log, buffer en disco que da durabilidad ante caídas antes de persistir los datos |
+
+---
+
+<a name="16-referencias"></a>
+## 📚 16. Referencias
 
 | Herramienta | Documentación |
 |---|---|
