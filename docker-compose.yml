@@ -141,7 +141,7 @@ services:
     mem_limit: 256m
 
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.153.0
+    image: otel/opentelemetry-collector-contrib:0.154.0
     container_name: otel-collector
     user: "0"
     volumes:
