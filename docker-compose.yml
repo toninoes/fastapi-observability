@@ -245,7 +245,7 @@ services:
     restart: on-failure
 
   alertmanager:
-    image: prom/alertmanager:v0.32.2
+    image: prom/alertmanager:v0.33.1
     container_name: alertmanager
     ports:
       - "9093:9093"
