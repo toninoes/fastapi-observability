@@ -85,7 +85,7 @@ services:
     mem_limit: 128m
 
   postgres-exporter:
-    image: prometheuscommunity/postgres-exporter:v0.19.1
+    image: prometheuscommunity/postgres-exporter:v0.20.1
     container_name: postgres-exporter
     ports:
       - "9187:9187"
